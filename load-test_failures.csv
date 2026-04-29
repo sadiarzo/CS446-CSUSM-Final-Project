@@ -1,0 +1,10 @@
+Method,Name,Error,Occurrences
+GET,GET /session/state/[id],RemoteDisconnected('Remote end closed connection without response'),17
+GET,GET /session/state/[id],HTTPError('404 Client Error: NOT FOUND for url: GET /session/state/[id]'),1324
+POST,POST /session/create,"ConnectionRefusedError(111, 'Connection refused')",2
+GET,GET /ping,RemoteDisconnected('Remote end closed connection without response'),85
+POST,POST /session/update,RemoteDisconnected('Remote end closed connection without response'),34
+DELETE,DELETE /session/end/[id],HTTPError('404 Client Error: NOT FOUND for url: DELETE /session/end/[id]'),57
+GET,GET /status,RemoteDisconnected('Remote end closed connection without response'),5
+GET,GET /ping,"ConnectionResetError(104, 'Connection reset by peer')",5
+POST,POST /session/update,HTTPError('404 Client Error: NOT FOUND for url: POST /session/update'),2321
