@@ -16,16 +16,23 @@ spec:
     spec:
       containers:
       - name: game-server
-        image: gcr.io/multiplayer-cloud-490706/game-server:v1
+        image: gcr.io/multiplayer-cloud-490706/game-server:v3
         ports:
         - containerPort: 8080
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: GOOGLE_CLOUD_PROJECT
+          value: "multiplayer-cloud-490706"
         resources:
           requests:
             cpu: "100m"
-            memory: "128Mi"
+            memory: "256Mi"
           limits:
             cpu: "500m"
-            memory: "256Mi"
+            memory: "512Mi"
         readinessProbe:
           httpGet:
             path: /ping

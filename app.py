@@ -1,132 +1,221 @@
+"""
+Multiplayer Game Server — v3 with Cloud Firestore + Cloud Pub/Sub.
+
+Adds event publishing on session lifecycle changes for downstream
+analytics and inter-service communication. Events are best-effort —
+publish failures are logged but never block the API response, since
+the source of truth is Firestore.
+"""
 from flask import Flask, request, jsonify
+from google.cloud import firestore
+from google.cloud import pubsub_v1
 import uuid
 import time
 import random
+import os
+import socket
+import logging
+import json
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# In-memory session store (simulates Firestore for prototype phase)
-sessions = {}
+# ── Cloud clients ────────────────────────────────────────────────────────────
+db = firestore.Client()
+SESSIONS = db.collection("sessions")
+PLAYERS = db.collection("players")
 
-# ── Health check ──────────────────────────────────────────────────────────────
+publisher = pubsub_v1.PublisherClient()
+PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "multiplayer-cloud-490706")
+TOPIC_PATH = publisher.topic_path(PROJECT_ID, "session-events")
+
+POD_NAME = os.environ.get("POD_NAME", socket.gethostname())
+
+
+def publish_event(event_type, session_id, payload=None):
+    """Publish a session event to Pub/Sub. Best-effort — never raises."""
+    try:
+        message = {
+            "event_type": event_type,
+            "session_id": session_id,
+            "timestamp": time.time(),
+            "pod": POD_NAME,
+            "payload": payload or {},
+        }
+        publisher.publish(
+            TOPIC_PATH,
+            data=json.dumps(message).encode("utf-8"),
+            event_type=event_type,
+        )
+        log.info(f"Published {event_type} for session {session_id}")
+    except Exception as e:
+        log.warning(f"Pub/Sub publish failed (non-fatal): {e}")
+
+
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({
+        "service": "Multiplayer Game Server",
+        "version": "v3",
+        "storage": "Cloud Firestore",
+        "messaging": "Cloud Pub/Sub",
+        "pod": POD_NAME,
+    }), 200
+
 
 @app.route("/ping", methods=["GET"])
 def ping():
-    """Latency probe used by load testing and Cloud Monitoring."""
     return jsonify({
         "status": "ok",
         "timestamp": time.time(),
-        "server": "game-server-pod"
+        "pod": POD_NAME,
+        "version": "v3"
     }), 200
 
-# ── Session management ────────────────────────────────────────────────────────
+
+@app.route("/status", methods=["GET"])
+def server_status():
+    try:
+        active_query = SESSIONS.where("status", "==", "active").limit(100).stream()
+        active_count = sum(1 for _ in active_query)
+    except Exception as e:
+        log.warning(f"Status query failed: {e}")
+        active_count = -1
+    return jsonify({
+        "active_sessions": active_count,
+        "pod": POD_NAME,
+        "storage": "firestore",
+        "messaging": "pubsub",
+        "uptime": time.time(),
+    }), 200
+
 
 @app.route("/session/create", methods=["POST"])
 def create_session():
-    """
-    Creates a new player session.
-    Body (JSON): { "player_id": "string", "display_name": "string" }
-    Returns: session_id, assigned server pod, initial player state
-    """
     data = request.get_json(silent=True) or {}
     player_id = data.get("player_id", str(uuid.uuid4()))
-    display_name = data.get("display_name", f"Player_{random.randint(1000,9999)}")
-
+    display_name = data.get("display_name", f"Player_{random.randint(1000, 9999)}")
     session_id = str(uuid.uuid4())
-    sessions[session_id] = {
+    now = time.time()
+
+    session_doc = {
         "session_id": session_id,
         "player_id": player_id,
         "display_name": display_name,
-        "created_at": time.time(),
-        "last_updated": time.time(),
+        "created_at": now,
+        "last_updated": now,
         "status": "active",
+        "server_pod": POD_NAME,
         "state": {
             "position_x": 0.0,
             "position_y": 0.0,
             "health": 100,
-            "score": 0
+            "score": 0,
         }
     }
+
+    try:
+        SESSIONS.document(session_id).set(session_doc)
+        PLAYERS.document(player_id).set(
+            {"display_name": display_name, "last_session_at": now},
+            merge=True
+        )
+    except Exception as e:
+        log.error(f"Firestore write failed: {e}")
+        return jsonify({"error": "storage unavailable"}), 503
+
+    publish_event("session.created", session_id, {
+        "player_id": player_id,
+        "display_name": display_name,
+    })
 
     return jsonify({
         "session_id": session_id,
         "player_id": player_id,
         "display_name": display_name,
-        "server_pod": "game-server-pod",
+        "server_pod": POD_NAME,
         "status": "active",
-        "message": "Session created successfully"
+        "message": "Session created"
     }), 201
 
 
 @app.route("/session/state/<session_id>", methods=["GET"])
 def get_state(session_id):
-    """Returns current player state for the given session."""
-    session = sessions.get(session_id)
-    if not session:
+    try:
+        doc = SESSIONS.document(session_id).get()
+    except Exception as e:
+        log.error(f"Firestore read failed: {e}")
+        return jsonify({"error": "storage unavailable"}), 503
+
+    if not doc.exists:
         return jsonify({"error": "Session not found"}), 404
 
+    s = doc.to_dict()
     return jsonify({
         "session_id": session_id,
-        "player_id": session["player_id"],
-        "display_name": session["display_name"],
-        "status": session["status"],
-        "state": session["state"],
-        "last_updated": session["last_updated"]
+        "player_id": s["player_id"],
+        "display_name": s["display_name"],
+        "status": s["status"],
+        "state": s["state"],
+        "server_pod_origin": s.get("server_pod"),
+        "served_by_pod": POD_NAME,
+        "last_updated": s["last_updated"],
     }), 200
 
 
 @app.route("/session/update", methods=["POST"])
 def update_state():
-    """
-    Updates player game state.
-    Body (JSON): { "session_id": "string", "state": { "position_x": float, ... } }
-    """
     data = request.get_json(silent=True) or {}
     session_id = data.get("session_id")
     new_state = data.get("state", {})
 
-    if not session_id or session_id not in sessions:
-        return jsonify({"error": "Session not found"}), 404
+    if not session_id:
+        return jsonify({"error": "session_id required"}), 400
 
-    sessions[session_id]["state"].update(new_state)
-    sessions[session_id]["last_updated"] = time.time()
+    ref = SESSIONS.document(session_id)
+    try:
+        doc = ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Session not found"}), 404
+        update_payload = {f"state.{k}": v for k, v in new_state.items()}
+        update_payload["last_updated"] = time.time()
+        ref.update(update_payload)
+    except Exception as e:
+        log.error(f"Firestore update failed: {e}")
+        return jsonify({"error": "storage unavailable"}), 503
+
+    if "score" in new_state:
+        publish_event("session.updated", session_id, {"score": new_state["score"]})
 
     return jsonify({
         "session_id": session_id,
-        "state": sessions[session_id]["state"],
-        "last_updated": sessions[session_id]["last_updated"],
+        "served_by_pod": POD_NAME,
         "message": "State updated"
     }), 200
 
 
 @app.route("/session/end/<session_id>", methods=["DELETE"])
 def end_session(session_id):
-    """Terminates a player session and cleans up state."""
-    if session_id not in sessions:
-        return jsonify({"error": "Session not found"}), 404
+    ref = SESSIONS.document(session_id)
+    try:
+        doc = ref.get()
+        if not doc.exists:
+            return jsonify({"error": "Session not found"}), 404
+        ref.update({"status": "ended", "ended_at": time.time()})
+    except Exception as e:
+        log.error(f"Firestore delete failed: {e}")
+        return jsonify({"error": "storage unavailable"}), 503
 
-    sessions[session_id]["status"] = "ended"
-    sessions.pop(session_id)
+    publish_event("session.ended", session_id)
 
     return jsonify({
         "session_id": session_id,
-        "message": "Session ended and cleaned up"
-    }), 200
-
-
-# ── Server info (bonus endpoint for demo) ────────────────────────────────────
-
-@app.route("/status", methods=["GET"])
-def server_status():
-    """Returns active session count and server metadata. Useful for demo."""
-    active = sum(1 for s in sessions.values() if s["status"] == "active")
-    return jsonify({
-        "active_sessions": active,
-        "total_sessions_tracked": len(sessions),
-        "server_pod": "game-server-pod",
-        "uptime": time.time()
+        "served_by_pod": POD_NAME,
+        "message": "Session ended"
     }), 200
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=False)
+    app.run(host="0.0.0.0", port=8080)
