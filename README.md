@@ -1,8 +1,5 @@
 # Scalable Cloud Architecture for Multiplayer Games
 
-CS 446 — Cloud Computing — Spring 2026
-Sadi Arzo · CSUSM
-
 ## Overview
 
 A cloud-native multiplayer game server backend deployed on Google Kubernetes Engine (GKE) with horizontal pod autoscaling, distributed load balancing, and Cloud Monitoring integration. The system simulates real-time multiplayer session management and serves as a testbed for evaluating cloud-native scalability against centralized server deployments.
